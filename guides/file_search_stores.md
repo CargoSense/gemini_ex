@@ -34,7 +34,6 @@ File Search Stores enable semantic search over your documents using vector embed
 
 ### Important Notes
 
-- **Vertex AI Only**: File Search Stores are only available through Vertex AI authentication
 - **Asynchronous Processing**: Store creation and document indexing happen asynchronously
 - **Automatic Chunking**: Documents are split into chunks optimized for retrieval
 
@@ -54,6 +53,8 @@ export GOOGLE_CLOUD_PROJECT="your-project-id"
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
 # Option B: JSON content directly (gemini_ex extension)
 export GOOGLE_APPLICATION_CREDENTIALS_JSON='{"type":"service_account",...}'
+# Option C: A Gemini API key that was issued by your Cloud Project
+export GEMINI_API_KEY="AQ...."
 ```
 
 ### Elixir Configuration

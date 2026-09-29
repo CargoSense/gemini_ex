@@ -112,6 +112,10 @@ defmodule Gemini.APIs.FileSearchStores do
           {:auth, :gemini | :vertex_ai}
         ]
 
+  @type document_opts :: [
+          {:auth, :gemini | :vertex_ai}
+        ]
+
   @type list_opts :: [
           {:page_size, pos_integer()}
           | {:page_token, String.t()}
@@ -131,6 +135,8 @@ defmodule Gemini.APIs.FileSearchStores do
           {:display_name, String.t()}
           | {:mime_type, String.t()}
           | {:auth, :gemini | :vertex_ai}
+          | {:file_contents, binary()}
+          | {:file_search_store, FileSearchStore.t()}
         ]
 
   @type wait_opts :: [
@@ -286,6 +292,35 @@ defmodule Gemini.APIs.FileSearchStores do
   end
 
   @doc """
+  List file documents in a `t:Gemini.Types.FileSearchStore.t/0`.
+
+  ## Parameters
+
+  - `store_name` - The name of the FileSearchStore
+  - `opts` - List options
+
+  ## Options
+
+  - `:auth` - Authentication strategy
+  """
+  @spec documents(store_name :: String.t(), opts :: document_opts()) :: {:ok, list(FileSearchDocument.t())} | {:error, any()}
+  def documents(store_name, opts \\ []) do
+    path = "#{normalize_store_path(store_name)}/documents"
+
+    case HTTP.get(path, opts) do
+      {:ok, response} ->
+        {:ok,
+         Enum.map(
+           Map.get(response, "documents", []),
+           fn d -> FileSearchDocument.from_api_response(d) end
+         )}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
   List all file search stores across all pages.
 
   Automatically handles pagination to retrieve all stores.
@@ -335,8 +370,8 @@ defmodule Gemini.APIs.FileSearchStores do
   @spec import_file(String.t(), String.t(), import_opts()) ::
           {:ok, FileSearchDocument.t()} | {:error, term()}
   def import_file(store_name, file_name, opts \\ []) do
-    path = "#{normalize_store_path(store_name)}:import"
-    body = %{"file" => normalize_file_path(file_name)}
+    path = "#{normalize_store_path(store_name)}:importFile"
+    body = %{"fileName" => normalize_file_path(file_name)}
 
     case HTTP.post(path, body, opts) do
       {:ok, response} -> {:ok, FileSearchDocument.from_api_response(response)}
@@ -376,10 +411,11 @@ defmodule Gemini.APIs.FileSearchStores do
           {:ok, FileSearchDocument.t()} | {:error, term()}
   def upload_to_store(store_name, file_path, opts \\ []) do
     # First upload the file
-    upload_opts = Keyword.take(opts, [:display_name, :mime_type, :auth])
+    upload_opts =
+      Keyword.take(opts, [:display_name, :mime_type, :auth, :file_contents])
+      |> Keyword.put(:file_search_store, store_name)
 
-    with {:ok, file} <- Files.upload(file_path, upload_opts),
-         {:ok, doc} <- import_file(store_name, file.name, opts) do
+    with {:ok, doc} <- Files.upload(file_path, upload_opts)  do
       {:ok, doc}
     else
       {:error, reason} -> {:error, reason}

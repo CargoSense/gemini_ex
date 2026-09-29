@@ -44,6 +44,23 @@ defmodule Gemini.APIs.FilesContractTest do
     :ok
   end
 
+  test "Files.register_files has proper auth priorities" do
+    fake_gemini = "a fake key"
+    Gemini.Env.put("GEMINI_API_KEY", nil)
+    Application.delete_env(:gemini_ex, :auth)
+    assert_raise(ArgumentError, fn -> Files.resolve_register_files_auth!([]) end)
+    assert :token == Files.resolve_register_files_auth!([credentials: %{token: "test"}]) 
+    assert :gemini == Files.resolve_register_files_auth!([api_key: fake_gemini]) 
+    
+    Gemini.Env.put("GEMINI_API_KEY", fake_gemini)
+    assert :gemini == Files.resolve_register_files_auth!([]) 
+    assert :token == Files.resolve_register_files_auth!([credentials: %{token: "test"}]) 
+    # overriding gemini still works w/o fallback
+    Gemini.Env.put("GEMINI_API_KEY", nil)
+    assert :gemini == Files.resolve_register_files_auth!([credentials: %{token: "test"}, api_key: fake_gemini]) 
+
+  end
+
   test "upload/2 uses the resolved Gemini API key and omits output-only mimeType metadata" do
     Gemini.Env.put("GEMINI_API_KEY", "env-api-key")
     Application.delete_env(:gemini_ex, :auth)
@@ -107,6 +124,143 @@ defmodule Gemini.APIs.FilesContractTest do
 
     assert_receive {:req_request, _start_request}
     assert_receive {:req_request, _upload_request}
+  end
+
+  test "upload/2 can upload to a FileSearchStore" do
+    Gemini.Env.put("GEMINI_API_KEY", "env-api-key")
+    Gemini.Env.put("GEMINI_API_KEY", "env-api-key")
+
+    :meck.new(Req, [:non_strict, :passthrough])
+
+    test_pid = self()
+
+    test_store_name = "test-filestore"
+
+    :meck.expect(Req, :post, fn url, opts ->
+      send(test_pid, {:req_request, {:start, url, opts}})
+
+      assert url =~ "test-filestore:uploadToFileSearchStore"
+
+      metadata =
+        opts
+        |> Keyword.fetch!(:body)
+        |> Jason.decode!()
+
+      # uploadToFileSearchStore uses a different structure for the metadata
+      assert metadata == %{"display_name" => Path.basename(@fixture_path) }
+
+      {:ok,
+       %Req.Response{
+         status: 200,
+         headers: [{"x-goog-upload-url", "https://upload.example/files/test"}],
+         body: %{}
+       }}
+    end)
+
+    :meck.expect(Req, :post, fn req ->
+      send(test_pid, {:req_request, {:upload, req}})
+
+      {:ok,
+       %Req.Response{
+         status: 200,
+         body: %{
+           "file" => %{
+             "name" => "files/test-document",
+             "displayName" => "test_document.pdf",
+             "mimeType" => "application/pdf",
+             "uri" => "https://generativelanguage.googleapis.com/v1beta/files/test-document",
+             "state" => "ACTIVE"
+           }
+         }
+       }}
+    end)
+
+    assert {:ok, file} =
+             Files.upload(@fixture_path,
+               auth: :gemini,
+               api_key: "override-api-key",
+               file_search_store: test_store_name
+             )
+
+    assert file.name == "files/test-document"
+    assert file.mime_type == "application/pdf"
+
+    assert_receive {:req_request, _start_request}
+  end
+
+  test "upload/2 can take a buffer instead of a file path" do
+    Gemini.Env.put("GEMINI_API_KEY", "env-api-key")
+
+    :meck.new(Req, [:non_strict, :passthrough])
+
+    test_pid = self()
+
+    test_body = "I am a random binary"
+    test_name = "test_document.pdf"
+
+    :meck.expect(Req, :post, fn url, opts ->
+      send(test_pid, {:req_request, {:start, url, opts}})
+
+      metadata =
+        opts
+        |> Keyword.fetch!(:body)
+        |> Jason.decode!()
+
+      assert metadata == %{
+               "file" => %{
+                 "displayName" => test_name
+               }
+             }
+
+      {:ok,
+       %Req.Response{
+         status: 200,
+         headers: [{"x-goog-upload-url", "https://upload.example/files/test"}],
+         body: %{}
+       }}
+    end)
+
+    :meck.expect(Req, :post, fn req ->
+      send(test_pid, {:req_request, {:upload, req}})
+
+      assert request_body(req) == test_body
+
+      {:ok,
+       %Req.Response{
+         status: 200,
+         body: %{
+           "file" => %{
+             "name" => "files/test-document",
+             "displayName" => "test_document.pdf",
+             "mimeType" => "application/pdf",
+             "uri" => "https://generativelanguage.googleapis.com/v1beta/files/test-document",
+             "state" => "ACTIVE"
+           }
+         }
+       }}
+    end)
+
+    assert {:ok, file} = Files.upload("test_document.pdf", auth: :gemini, api_key: "override-api-key", file_contents: test_body)
+
+    assert file.name == "files/test-document"
+    assert file.mime_type == "application/pdf"
+
+    assert_receive {:req_request, _start_request}
+    assert_receive {:req_request, _upload_request}
+  end
+
+  test "Files.upload correctly notes when the upload failed" do
+    :meck.new(Req, [:non_strict, :passthrough])
+
+    :meck.expect(Req, :post, fn _req ->
+      flunk("Files.upload should never make an html request when improper auth is provided")
+    end)
+
+    assert {:error, %Error{type: :config_error, message: message}} =
+             Files.upload(@fixture_path, auth: :vertex_ai) 
+
+    assert message =~ "Gemini Developer API"
+    assert message =~ "Vertex AI"
   end
 
   test "upload_data/2 rejects Vertex AI auth before attempting a request" do

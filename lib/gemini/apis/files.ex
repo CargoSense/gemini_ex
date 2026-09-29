@@ -69,6 +69,8 @@ defmodule Gemini.APIs.Files do
           | {:on_progress, (integer(), integer() -> any())}
           | {:api_key, String.t()}
           | {:auth, :gemini | :vertex_ai}
+          | {:file_contents, binary()}
+          | {:file_search_store, Gemini.Types.FileSearchStore.t()}
         ]
 
   @type list_opts :: [
@@ -102,6 +104,10 @@ defmodule Gemini.APIs.Files do
   - `:name` - Custom file resource name (auto-generated if not provided)
   - `:display_name` - Human-readable display name (max 512 characters)
   - `:mime_type` - MIME type (auto-detected from extension if not provided)
+  - `:file_contents` - Binary of file contents if file is already loaded in memory. `file_path` is still required if
+    using MIME-detection.
+  - `:file_search_store` - If specified, will upload to the file to a FileSearchStore instead of the general Gemini file
+    repository. See `Gemini.APIs.FileSearchStores` for more information on the difference.
   - `:on_progress` - Callback function `fn(uploaded_bytes, total_bytes) -> any()` for progress updates
   - `:api_key` - Per-request Gemini API key override
   - `:auth` - Authentication strategy (must be `:gemini`)
@@ -136,16 +142,29 @@ defmodule Gemini.APIs.Files do
   def upload(file_path, opts \\ []) do
     file_path = to_string(file_path)
 
+    buffer = Keyword.get(opts, :file_contents)
     # Validate file exists
-    if @elixir_file.exists?(file_path) do
+    if buffer != nil or @elixir_file.exists?(file_path) do
       # Get file info
-      file_size = @elixir_file.stat!(file_path).size
+      file_size =
+        if buffer do
+          byte_size(buffer)
+        else
+          @elixir_file.stat!(file_path).size
+        end
+
       mime_type = Keyword.get(opts, :mime_type) || detect_mime_type(file_path)
       display_name = Keyword.get(opts, :display_name) || Path.basename(file_path)
 
       # Prepare file metadata. MIME type is sent via upload headers; the File
       # resource's mimeType field is output-only and should not be included here.
-      file_metadata = %{file: %{displayName: display_name}}
+      file_metadata =
+        if Keyword.get(opts, :file_search_store) do
+          # The payload format is different when uploading to a FSS
+          %{display_name: display_name}
+        else
+          %{file: %{displayName: display_name}}
+        end
 
       # Add custom name if provided
       file_metadata =
@@ -163,9 +182,19 @@ defmodule Gemini.APIs.Files do
                mime_type,
                auth_config.credentials.api_key,
                opts
-             ),
-           {:ok, response} <- upload_file_data(upload_url, file_path, file_size, opts) do
-        {:ok, File.from_api_response(response)}
+             ) do
+        if buffer do
+          upload_binary_data(upload_url, buffer, file_size, opts)
+        else
+          upload_file_data(upload_url, file_path, file_size, opts)
+        end
+        |> case do
+          {:ok, response} ->
+            {:ok, File.from_api_response(response)}
+
+          {:error, why} ->
+            {:error, {:upload_error, why}}
+        end
       end
     else
       {:error, {:file_not_found, file_path}}
@@ -401,7 +430,15 @@ defmodule Gemini.APIs.Files do
     # The upload endpoint uses a different URL structure:
     # https://generativelanguage.googleapis.com/upload/v1beta/files
     # NOT the standard base_url/path pattern
-    url = "https://generativelanguage.googleapis.com/upload/v1beta/files?key=#{api_key}"
+    file_search_store = Keyword.get(opts, :file_search_store)
+
+    url =
+      if file_search_store do
+        "https://generativelanguage.googleapis.com/upload/v1beta/#{file_search_store}:uploadToFileSearchStore?key=#{api_key}"
+      else
+        "https://generativelanguage.googleapis.com/upload/v1beta/files?key=#{api_key}"
+      end
+
     timeout = Keyword.get(opts, :timeout, Config.timeout())
 
     headers = [
@@ -742,7 +779,8 @@ defmodule Gemini.APIs.Files do
 
   - `uris` - List of GCS URIs (e.g., `["gs://bucket/object"]`)
   - `opts` - Options:
-    - `:credentials` - Google Cloud credentials (required). Can be:
+    - `:credentials` - Google Cloud credentials. Preferred over configured gemini key.
+      Can be:
       - A map with `:token` key containing the access token
       - A Goth token struct
     - `:config` - Optional RegisterFilesConfig
@@ -780,21 +818,28 @@ defmodule Gemini.APIs.Files do
   @spec register_files([String.t()], register_files_opts()) ::
           {:ok, RegisterFilesResponse.t()} | {:error, term()}
   def register_files(uris, opts \\ []) when is_list(uris) do
-    with {:ok, _auth_config} <- resolve_gemini_files_auth(opts) do
+    with true <- (resolve_register_files_auth!(opts) ) in [:gemini, :token] do
       do_register_files(uris, opts)
     end
   end
 
   defp do_register_files(uris, opts) do
-    credentials = Keyword.fetch!(opts, :credentials)
-    token = get_token_from_credentials(credentials)
-    {:ok, auth_config} = resolve_gemini_files_auth(opts)
+    credentials = Keyword.get(opts, :credentials)
+    base_url = "https://generativelanguage.googleapis.com/v1beta/files:register"
+    headers = [{"content-type", "application/json"}]
     timeout = Keyword.get(opts, :timeout, Config.timeout())
 
-    headers = [
-      {"authorization", "Bearer #{token}"},
-      {"content-type", "application/json"}
-    ]
+    # Select auth type and resolve credentials
+    {headers, url} =
+      case resolve_register_files_auth!(opts) do
+        :token ->
+          token = get_token_from_credentials(credentials)
+          {[{"authorization", "Bearer #{token}"} | headers], base_url}
+
+        :gemini ->
+          {:ok, auth_config} = resolve_gemini_files_auth(opts)
+          {headers, "#{base_url}?key=#{auth_config.credentials.api_key}"}
+      end
 
     # Add quota project header if available
     headers =
@@ -807,10 +852,6 @@ defmodule Gemini.APIs.Files do
       end
 
     body = Jason.encode!(%{"uris" => uris})
-
-    # Build the URL using the API key
-    api_key = auth_config.credentials.api_key
-    url = "https://generativelanguage.googleapis.com/v1beta/files:register?key=#{api_key}"
 
     case Req.post(url, body: body, headers: headers, receive_timeout: timeout) do
       {:ok, %Req.Response{status: 200, body: response}} ->
@@ -826,15 +867,13 @@ defmodule Gemini.APIs.Files do
 
   defp get_token_from_credentials(%{token: token}) when is_binary(token), do: token
 
-  defp get_token_from_credentials(credentials) do
-    raise_credentials_error(credentials)
-  end
+  defp get_token_from_credentials(_credentials), do: nil
 
-  defp raise_credentials_error(credentials) do
+  defp raise_credentials_error!(credentials) do
     raise ArgumentError, """
     Invalid credentials format for register_files.
 
-    Expected a map with :token key or a Goth.Token struct.
+    Expected valid gemini API auth or a map with :token key or a Goth.Token struct.
     Got: #{inspect(credentials)}
 
     Example:
@@ -843,8 +882,31 @@ defmodule Gemini.APIs.Files do
     """
   end
 
+  @spec resolve_register_files_auth!(keyword()) :: :gemini | :token | no_return()
+  def resolve_register_files_auth!(opts) do
+    # prefer token
+    override_key = Keyword.get(opts, :api_key)
+    credentials = Keyword.get(opts, :credentials) 
+
+    cond do
+      override_key != nil ->
+        :gemini
+
+      get_token_from_credentials(credentials) != nil ->
+        :token
+
+      true ->
+        case resolve_gemini_files_auth(opts) do
+          {:ok, _} ->
+            :gemini
+          _ -> 
+            raise_credentials_error!(credentials)
+        end
+    end
+  end
+
   defp resolve_gemini_files_auth(opts) do
-    case HTTP.auth_config_for_request(opts) do
+    case HTTP.auth_config_for_request(opts)  do
       %{type: :gemini, credentials: %{api_key: api_key}} = auth_config
       when is_binary(api_key) and api_key != "" ->
         {:ok, auth_config}
