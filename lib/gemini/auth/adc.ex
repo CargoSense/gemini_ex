@@ -80,7 +80,8 @@ defmodule Gemini.Auth.ADC do
                                    "~/.config/gcloud/application_default_credentials.json"
                                  )
   @oauth2_token_uri "https://oauth2.googleapis.com/token"
-  @vertex_ai_scopes ["https://www.googleapis.com/auth/cloud-platform"]
+  # scope list from https://ai.google.dev/gemini-api/docs/oauth
+  @vertex_ai_scopes ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/generative-language.retriever"]
   @service_account_json_key_map %{
     "type" => :type,
     "project_id" => :project_id,
